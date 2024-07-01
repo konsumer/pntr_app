@@ -61,6 +61,5 @@ pntr_sound* pntr_load_sfx(SfxParams* params) {
   if (synth != NULL) {
     free(synth);
   }
-  free(w);
   return s;
 }
