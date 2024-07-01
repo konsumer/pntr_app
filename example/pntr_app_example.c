@@ -5,6 +5,7 @@
 #define PNTR_ENABLE_VARGS
 #define PNTR_DISABLE_MATH
 #include "pntr_app.h"
+#include "pntr_sfx.h"
 
 typedef struct AppData {
     pntr_image* logo;
@@ -13,6 +14,7 @@ typedef struct AppData {
     float x;
     pntr_sound* sound;
     pntr_sound* music;
+    pntr_sound* sfx;
     float velocity;
 
     pntr_image* droppedImage;
@@ -38,6 +40,11 @@ bool Init(pntr_app* app) {
     pntr_app_set_title(app, "pntr_app: Examples");
     pntr_app_set_icon(app, appData->logo);
 
+    SfxParams* params = malloc(96);
+    _pntr_load_sfx_app = app;
+    sfx_genPowerup(params);
+    appData->sfx = pntr_load_sfx(params);
+
     return true;
 }
 
@@ -60,6 +67,7 @@ bool Update(pntr_app* app, pntr_image* screen) {
 
     if (appData->spacePressed) {
         pntr_draw_text(screen, appData->font, "Space is Pressed!", 10, 10, PNTR_BLACK);
+        pntr_play_sound(appData->sfx, 0);
     }
     else {
         pntr_draw_text(screen, appData->font, "Space is not pressed", 10, 10, PNTR_BLACK);
