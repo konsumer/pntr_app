@@ -67,7 +67,6 @@ bool Update(pntr_app* app, pntr_image* screen) {
 
     if (appData->spacePressed) {
         pntr_draw_text(screen, appData->font, "Space is Pressed!", 10, 10, PNTR_BLACK);
-        pntr_play_sound(appData->sfx, 0);
     }
     else {
         pntr_draw_text(screen, appData->font, "Space is not pressed", 10, 10, PNTR_BLACK);
@@ -117,7 +116,8 @@ void Event(pntr_app* app, pntr_app_event* event) {
                 appData->spacePressed = true;
             }
 
-            pntr_play_sound(appData->sound, false);
+            // pntr_play_sound(appData->sound, false);
+            pntr_play_sound(appData->sfx, false);
 
             pntr_app_log_ex(PNTR_APP_LOG_INFO, "Key Pressed: %c", (char)event->key);
 
