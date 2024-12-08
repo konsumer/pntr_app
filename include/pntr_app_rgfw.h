@@ -11,6 +11,7 @@ typedef struct pntr_app_rgfw_platform {
     int mouseY;
     bool keysEnabled[PNTR_APP_KEY_LAST];
     bool mouseButtonsPressed[PNTR_APP_MOUSE_BUTTON_LAST];
+    RGFW_window* window;
 } pntr_app_rgfw_platform;
 
 #endif  // PNTR_APP_RGFW_H__
@@ -19,17 +20,19 @@ typedef struct pntr_app_rgfw_platform {
 #ifndef PNTR_APP_RGFW_IMPLEMENTATION_ONCE
 #define PNTR_APP_RGFW_IMPLEMENTATION_ONCE
 
-#include <stdlib.h> // realloc
-#include <stdio.h>
-#include <time.h> // time()
-#include <string.h> // memset
-
 bool pntr_app_platform_events(pntr_app* app) {
 	if (app == NULL || app->platform == NULL) {
   	return false;
   }
 
-  // TODO: process events
+  pntr_app_rgfw_platform* platform = (pntr_app_rgfw_platform*)app->platform;
+  while(RGFW_window_checkEvent(platform->window)) {
+		if (platform->window->event.type == RGFW_quit) {
+			return false;
+		}
+	}
+  
+  // TODO: process other events
 
   return true;
 }
@@ -52,8 +55,13 @@ bool pntr_app_platform_init(pntr_app* app) {
 	if (app == NULL) {
   	return false;
 	}
-
-	// TODO: init platform
+	app->platform = pntr_load_memory(sizeof(pntr_app_rgfw_platform));
+  if (app->platform == NULL) {
+      return false;
+  }
+  pntr_app_rgfw_platform* platform = (pntr_app_rgfw_platform*)app->platform;
+  platform->window = RGFW_createWindow(app->title, RGFW_RECT(app->width, app->height,app->width, app->height), (uint64_t)RGFW_CENTER);
+	
 	
 	return true;
 }
@@ -65,6 +73,9 @@ void pntr_app_platform_close(pntr_app* app) {
   if (app == NULL) {
     return;
   }
+
+  pntr_app_rgfw_platform* platform = (pntr_app_rgfw_platform*)app->platform;
+  RGFW_window_close(platform->window);
 
   pntr_unload_memory(app->platform);
   app->platform = NULL;
@@ -112,7 +123,7 @@ bool pntr_app_platform_set_size(pntr_app* app, int width, int height) {
 PNTR_APP_API void pntr_app_set_icon(pntr_app* app, pntr_image* icon) {
   (void)app;
   (void)icon;
-  // TODO: set icon
+  // TODO: set icon RGFW_window_setIcon(platform->window, icon, RGFW_AREA(3, 3), 4);
 }
 
 #endif  // PNTR_APP_RGFW_IMPLEMENTATION_ONCE
