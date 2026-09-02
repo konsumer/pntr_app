@@ -157,8 +157,10 @@ pio run -e cyd -t upload -t monitor
 
 Keep the screen small. pntr allocates it as one contiguous RGBA8888 buffer, and a board
 without PSRAM cannot hand out 320x240x4 bytes in one block, so declare something like
-160x120 in `Main()` and let the platform upscale it onto the panel. See
-[example/esp32](example/esp32) for the details.
+160x120 in `Main()` and let the platform upscale it onto the panel.
+
+Define `PNTR_APP_ESP32_SD` to mount a microSD card and point `pntr_load_file()` and
+`pntr_save_file()` at it. See [example/esp32](example/esp32) for the details.
 
 ### Web
 

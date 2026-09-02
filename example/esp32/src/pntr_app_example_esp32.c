@@ -10,6 +10,9 @@
 
 typedef struct AppData {
     pntr_font* font;
+    pntr_image* logo;
+    unsigned int boots;
+    bool haveCard;
     float x;
     float y;
     float velocityX;
@@ -28,6 +31,28 @@ bool Init(pntr_app* app) {
     }
 
     appData->font = pntr_load_font_default();
+
+    // Count how many times we have booted, which round-trips the SD card file hooks.
+    unsigned int size = 0;
+    unsigned int* saved = (unsigned int*)pntr_load_file("pntr_app_boots.dat", &size);
+    appData->haveCard = (saved != NULL && size == sizeof(unsigned int));
+    appData->boots = appData->haveCard ? *saved + 1 : 1;
+    pntr_unload_memory(saved);
+
+    if (pntr_save_file("pntr_app_boots.dat", &appData->boots, sizeof(unsigned int))) {
+        appData->haveCard = true;
+        pntr_app_log(PNTR_APP_LOG_INFO, "pntr_app_example_esp32: saved the boot count to the SD card");
+    }
+    else {
+        pntr_app_log(PNTR_APP_LOG_WARNING, "pntr_app_example_esp32: could not write to the SD card");
+    }
+
+    // Optional artwork. Keep it small: stb_image needs roughly 2.5x the decoded size in
+    // scratch, so 96x96 decodes on this board but 128x128 runs out of memory.
+    appData->logo = pntr_load_image("logo.png");
+    if (appData->logo == NULL) {
+        pntr_app_log(PNTR_APP_LOG_INFO, "pntr_app_example_esp32: no logo.png on the card, skipping it");
+    }
     appData->x = (float)(pntr_app_width(app) / 2);
     appData->y = (float)(pntr_app_height(app) / 2);
     appData->velocityX = 47.0f;
@@ -85,6 +110,12 @@ bool Update(pntr_app* app, pntr_image* screen) {
         appData->velocityY = -appData->velocityY;
     }
 
+    if (appData->logo != NULL) {
+        pntr_draw_image(screen, appData->logo,
+            (width - appData->logo->width) / 2,
+            (height - appData->logo->height) / 2);
+    }
+
     pntr_draw_circle_fill(screen, (int)appData->x, (int)appData->y, BALL_RADIUS, PNTR_SKYBLUE);
     pntr_draw_rectangle(screen, 0, 0, width, height, PNTR_WHITE);
 
@@ -93,9 +124,17 @@ bool Update(pntr_app* app, pntr_image* screen) {
         pntr_draw_circle(screen, (int)appData->touchX, (int)appData->touchY, 6, PNTR_YELLOW);
     }
 
-    char message[32];
+    char message[48];
     snprintf(message, sizeof(message), "%dx%d @ %d fps", width, height, pntr_app_fps(app));
     pntr_draw_text(screen, appData->font, message, 4, 4, PNTR_WHITE);
+
+    if (appData->haveCard) {
+        snprintf(message, sizeof(message), "SD ok, boot #%u", appData->boots);
+    }
+    else {
+        snprintf(message, sizeof(message), "no SD card");
+    }
+    pntr_draw_text(screen, appData->font, message, 4, 14, PNTR_WHITE);
 
     return true;
 }
@@ -106,6 +145,7 @@ void Close(pntr_app* app) {
         return;
     }
 
+    pntr_unload_image(appData->logo);
     pntr_unload_font(appData->font);
     pntr_unload_memory(appData);
 }

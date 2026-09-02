@@ -8,7 +8,13 @@
 *
 *   BOARDS:
 *       PNTR_APP_ESP32_BOARD_CYD  ESP32-2432S028R "Cheap Yellow Display" (default)
-*                                 320x240 ILI9341 + XPT2046 resistive touch
+*                                 320x240 ILI9341 + XPT2046 resistive touch + microSD
+*
+*   SPI BUSES:
+*       The ESP32 has two general purpose SPI hosts, and the CYD wants three separate sets
+*       of pins. The display takes one host and the SD card takes the other, so the touch
+*       panel is bit-banged. The XPT2046 tops out at 2MHz and is only read while its IRQ
+*       line is low, so it costs almost nothing to drive in software.
 *
 *   MEMORY:
 *       pntr allocates the screen as one contiguous RGBA8888 buffer, so a 320x240 screen
@@ -22,12 +28,15 @@
 *       PNTR_APP_ESP32_LCD_BACKLIGHT, PNTR_APP_ESP32_LCD_WIDTH, PNTR_APP_ESP32_LCD_HEIGHT,
 *       PNTR_APP_ESP32_LCD_SPEED, PNTR_APP_ESP32_LCD_MADCTL,
 *       PNTR_APP_ESP32_LCD_BAND_ROWS, PNTR_APP_ESP32_SCALE
-*       PNTR_APP_ESP32_TOUCH_SPI_HOST, PNTR_APP_ESP32_TOUCH_MOSI, PNTR_APP_ESP32_TOUCH_MISO,
-*       PNTR_APP_ESP32_TOUCH_SCLK, PNTR_APP_ESP32_TOUCH_CS, PNTR_APP_ESP32_TOUCH_IRQ,
+*       PNTR_APP_ESP32_TOUCH_MOSI, PNTR_APP_ESP32_TOUCH_MISO, PNTR_APP_ESP32_TOUCH_SCLK,
+*       PNTR_APP_ESP32_TOUCH_CS, PNTR_APP_ESP32_TOUCH_IRQ, PNTR_APP_ESP32_TOUCH_DELAY,
 *       PNTR_APP_ESP32_TOUCH_MIN_X, PNTR_APP_ESP32_TOUCH_MAX_X,
 *       PNTR_APP_ESP32_TOUCH_MIN_Y, PNTR_APP_ESP32_TOUCH_MAX_Y,
 *       PNTR_APP_ESP32_TOUCH_SWAP_XY, PNTR_APP_ESP32_TOUCH_INVERT_X,
 *       PNTR_APP_ESP32_TOUCH_INVERT_Y, PNTR_APP_ESP32_NO_TOUCH
+*       PNTR_APP_ESP32_SD (opt in), PNTR_APP_ESP32_SD_SPI_HOST, PNTR_APP_ESP32_SD_MOSI,
+*       PNTR_APP_ESP32_SD_MISO, PNTR_APP_ESP32_SD_SCLK, PNTR_APP_ESP32_SD_CS,
+*       PNTR_APP_ESP32_SD_SPEED, PNTR_APP_ESP32_SD_MOUNT_POINT, PNTR_APP_ESP32_SD_MAX_FILES
 *
 *   LICENSE: zlib/libpng
 *
@@ -40,6 +49,10 @@
 #include <stdint.h>
 
 #include "driver/spi_master.h"
+
+#ifdef PNTR_APP_ESP32_SD
+#include "sdmmc_cmd.h"
+#endif
 
 // Board profile. Default to the Cheap Yellow Display.
 #if !defined(PNTR_APP_ESP32_BOARD_CYD) && !defined(PNTR_APP_ESP32_BOARD_CUSTOM)
@@ -76,9 +89,6 @@
     #ifndef PNTR_APP_ESP32_LCD_HEIGHT
         #define PNTR_APP_ESP32_LCD_HEIGHT 240
     #endif
-    #ifndef PNTR_APP_ESP32_TOUCH_SPI_HOST
-        #define PNTR_APP_ESP32_TOUCH_SPI_HOST SPI3_HOST
-    #endif
     #ifndef PNTR_APP_ESP32_TOUCH_MOSI
         #define PNTR_APP_ESP32_TOUCH_MOSI 32
     #endif
@@ -95,11 +105,25 @@
         #define PNTR_APP_ESP32_TOUCH_IRQ 36
     #endif
     #ifndef PNTR_APP_ESP32_TOUCH_SWAP_XY
-        // The panel is wired portrait, the display is driven landscape.
+        // The panel is wired portrait, the display is driven landscape. Swapping the axes is
+        // all it takes; neither axis needs inverting once they line up.
         #define PNTR_APP_ESP32_TOUCH_SWAP_XY 1
     #endif
-    #ifndef PNTR_APP_ESP32_TOUCH_INVERT_Y
-        #define PNTR_APP_ESP32_TOUCH_INVERT_Y 1
+    // microSD, on the ESP32's default VSPI pins.
+    #ifndef PNTR_APP_ESP32_SD_SPI_HOST
+        #define PNTR_APP_ESP32_SD_SPI_HOST SPI3_HOST
+    #endif
+    #ifndef PNTR_APP_ESP32_SD_MOSI
+        #define PNTR_APP_ESP32_SD_MOSI 23
+    #endif
+    #ifndef PNTR_APP_ESP32_SD_MISO
+        #define PNTR_APP_ESP32_SD_MISO 19
+    #endif
+    #ifndef PNTR_APP_ESP32_SD_SCLK
+        #define PNTR_APP_ESP32_SD_SCLK 18
+    #endif
+    #ifndef PNTR_APP_ESP32_SD_CS
+        #define PNTR_APP_ESP32_SD_CS 5
     #endif
 #endif  // PNTR_APP_ESP32_BOARD_CYD
 
@@ -152,6 +176,42 @@
 #define PNTR_APP_ESP32_TOUCH_INVERT_Y 0
 #endif
 
+#ifndef PNTR_APP_ESP32_TOUCH_DELAY
+/**
+ * Microseconds each half of the bit-banged touch clock is held for.
+ *
+ * 1us gives roughly a 500kHz clock, well inside the XPT2046's 2MHz limit. A whole poll is
+ * four 24-bit reads, so about 200us, and only while the panel is being touched.
+ */
+#define PNTR_APP_ESP32_TOUCH_DELAY 1
+#endif
+
+#ifdef PNTR_APP_ESP32_SD
+#ifndef PNTR_APP_ESP32_SD_SPEED
+/**
+ * SPI clock for the SD card, in kHz.
+ */
+#define PNTR_APP_ESP32_SD_SPEED 20000
+#endif
+
+#ifndef PNTR_APP_ESP32_SD_MOUNT_POINT
+/**
+ * Where the card's FAT filesystem is mounted.
+ *
+ * Relative paths handed to pntr_load_file() are resolved against this, so an application
+ * asking for "resources/logo.png" reads "/sdcard/resources/logo.png".
+ */
+#define PNTR_APP_ESP32_SD_MOUNT_POINT "/sdcard"
+#endif
+
+#ifndef PNTR_APP_ESP32_SD_MAX_FILES
+/**
+ * How many files may be open at once. Each one costs a sector buffer, so keep it small.
+ */
+#define PNTR_APP_ESP32_SD_MAX_FILES 3
+#endif
+#endif  // PNTR_APP_ESP32_SD
+
 typedef struct pntr_app_esp32_platform {
     spi_device_handle_t lcd;
     uint16_t* band[2];          // DMA-capable RGB565 scratch buffers.
@@ -167,10 +227,15 @@ typedef struct pntr_app_esp32_platform {
     int64_t lastTime;           // esp_timer_get_time() at the last delta time update.
 
     #ifndef PNTR_APP_ESP32_NO_TOUCH
-        spi_device_handle_t touch;
+        // The touch panel is bit-banged, so it needs no driver handle.
+        bool touchAvailable;
         bool touchDown;
         float mouseX;
         float mouseY;
+    #endif
+
+    #ifdef PNTR_APP_ESP32_SD
+        sdmmc_card_t* card;
     #endif
 } pntr_app_esp32_platform;
 
@@ -204,6 +269,11 @@ PNTR_APP_API bool pntr_app_esp32_loop(void);
 
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
+#ifdef PNTR_APP_ESP32_SD
+#include "driver/sdspi_host.h"
+#include "esp_vfs_fat.h"
+#endif
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -396,23 +466,80 @@ static void pntr_app_esp32_lcd_fill(pntr_app_esp32_platform* platform, uint16_t 
 
 #ifndef PNTR_APP_ESP32_NO_TOUCH
 /**
- * Reads one 12-bit channel from the XPT2046.
+ * Drives one bit-banged clock pulse, sampling MISO while the clock is high.
+ *
+ * The XPT2046 latches MOSI on the rising edge and shifts MISO out on the falling one, so
+ * the value is read after raising the clock.
  */
-static int pntr_app_esp32_touch_channel(pntr_app_esp32_platform* platform, uint8_t command) {
-    spi_transaction_t transaction;
-    memset(&transaction, 0, sizeof(transaction));
-    transaction.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    transaction.length = 24;
-    transaction.rxlength = 24;
-    transaction.tx_data[0] = command;
-    transaction.tx_data[1] = 0;
-    transaction.tx_data[2] = 0;
+static int pntr_app_esp32_touch_clock(void) {
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_SCLK, 1);
+    esp_rom_delay_us(PNTR_APP_ESP32_TOUCH_DELAY);
+    int bit = gpio_get_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_MISO);
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_SCLK, 0);
+    esp_rom_delay_us(PNTR_APP_ESP32_TOUCH_DELAY);
 
-    if (spi_device_polling_transmit(platform->touch, &transaction) != ESP_OK) {
-        return 0;
+    return bit;
+}
+
+/**
+ * Reads one 12-bit channel from the XPT2046 over software SPI.
+ *
+ * The ESP32's two hardware SPI hosts are taken by the display and the SD card, and the CYD
+ * wires the touch panel to a third set of pins, so this is bit-banged instead.
+ */
+static int pntr_app_esp32_touch_channel(uint8_t command) {
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_CS, 0);
+    esp_rom_delay_us(PNTR_APP_ESP32_TOUCH_DELAY);
+
+    // Command byte, most significant bit first.
+    for (int i = 7; i >= 0; i--) {
+        gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_MOSI, (command >> i) & 1);
+        esp_rom_delay_us(PNTR_APP_ESP32_TOUCH_DELAY);
+        pntr_app_esp32_touch_clock();
     }
 
-    return (((int)transaction.rx_data[1] << 8) | (int)transaction.rx_data[2]) >> 3;
+    // Sixteen more clocks carry the result back, left aligned with three padding bits.
+    int value = 0;
+    for (int i = 0; i < 16; i++) {
+        value = (value << 1) | pntr_app_esp32_touch_clock();
+    }
+
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_CS, 1);
+
+    return (value >> 3) & 0x0FFF;
+}
+
+/**
+ * Puts the bit-banged touch pins into a known state.
+ *
+ * @return True if the pins could be configured.
+ */
+static bool pntr_app_esp32_touch_init(void) {
+    gpio_config_t outputs;
+    memset(&outputs, 0, sizeof(outputs));
+    outputs.mode = GPIO_MODE_OUTPUT;
+    outputs.pin_bit_mask = (1ULL << PNTR_APP_ESP32_TOUCH_MOSI) |
+        (1ULL << PNTR_APP_ESP32_TOUCH_SCLK) |
+        (1ULL << PNTR_APP_ESP32_TOUCH_CS);
+    if (gpio_config(&outputs) != ESP_OK) {
+        return false;
+    }
+
+    // MISO and IRQ are inputs. Both are input-only pins on the CYD, so no pull is set.
+    gpio_config_t inputs;
+    memset(&inputs, 0, sizeof(inputs));
+    inputs.mode = GPIO_MODE_INPUT;
+    inputs.pin_bit_mask = (1ULL << PNTR_APP_ESP32_TOUCH_MISO) |
+        (1ULL << PNTR_APP_ESP32_TOUCH_IRQ);
+    if (gpio_config(&inputs) != ESP_OK) {
+        return false;
+    }
+
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_CS, 1);
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_SCLK, 0);
+    gpio_set_level((gpio_num_t)PNTR_APP_ESP32_TOUCH_MOSI, 0);
+
+    return true;
 }
 
 /**
@@ -426,10 +553,10 @@ static bool pntr_app_esp32_touch_read(pntr_app_esp32_platform* platform, float* 
     }
 
     // Throw away the first sample of each axis, it settles late.
-    pntr_app_esp32_touch_channel(platform, 0xD0);
-    int rawX = pntr_app_esp32_touch_channel(platform, 0xD0);
-    pntr_app_esp32_touch_channel(platform, 0x90);
-    int rawY = pntr_app_esp32_touch_channel(platform, 0x90);
+    pntr_app_esp32_touch_channel(0xD0);
+    int rawX = pntr_app_esp32_touch_channel(0xD0);
+    pntr_app_esp32_touch_channel(0x90);
+    int rawY = pntr_app_esp32_touch_channel(0x90);
 
     if (rawX <= 0 || rawY <= 0) {
         return false;
@@ -463,6 +590,166 @@ static bool pntr_app_esp32_touch_read(pntr_app_esp32_platform* platform, float* 
     return true;
 }
 #endif  // PNTR_APP_ESP32_NO_TOUCH
+
+#ifdef PNTR_APP_ESP32_SD
+/**
+ * Resolves an application path against the card's mount point.
+ *
+ * Applications ask for "resources/logo.png" the same way they do on the desktop, and that
+ * becomes "/sdcard/resources/logo.png". A path that is already absolute is left alone.
+ */
+static const char* pntr_app_esp32_sd_path(const char* fileName, char* buffer, size_t size) {
+    if (fileName == NULL) {
+        return NULL;
+    }
+
+    if (fileName[0] == '/') {
+        return fileName;
+    }
+
+    int written = snprintf(buffer, size, "%s/%s", PNTR_APP_ESP32_SD_MOUNT_POINT, fileName);
+    if (written <= 0 || (size_t)written >= size) {
+        return NULL;
+    }
+
+    return buffer;
+}
+
+/**
+ * Mounts the card's FAT filesystem.
+ *
+ * @return True if a card was mounted.
+ */
+static bool pntr_app_esp32_sd_mount(pntr_app_esp32_platform* platform) {
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = PNTR_APP_ESP32_SD_SPI_HOST;
+    host.max_freq_khz = PNTR_APP_ESP32_SD_SPEED;
+
+    spi_bus_config_t bus;
+    memset(&bus, 0, sizeof(bus));
+    bus.mosi_io_num = PNTR_APP_ESP32_SD_MOSI;
+    bus.miso_io_num = PNTR_APP_ESP32_SD_MISO;
+    bus.sclk_io_num = PNTR_APP_ESP32_SD_SCLK;
+    bus.quadwp_io_num = -1;
+    bus.quadhd_io_num = -1;
+    bus.max_transfer_sz = 4096;
+
+    if (spi_bus_initialize((spi_host_device_t)host.slot, &bus, SPI_DMA_CH_AUTO) != ESP_OK) {
+        return false;
+    }
+
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.gpio_cs = (gpio_num_t)PNTR_APP_ESP32_SD_CS;
+    slot.host_id = (spi_host_device_t)host.slot;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount;
+    memset(&mount, 0, sizeof(mount));
+    mount.format_if_mount_failed = false;
+    mount.max_files = PNTR_APP_ESP32_SD_MAX_FILES;
+    mount.allocation_unit_size = 16 * 1024;
+
+    if (esp_vfs_fat_sdspi_mount(PNTR_APP_ESP32_SD_MOUNT_POINT, &host, &slot, &mount, &platform->card) != ESP_OK) {
+        spi_bus_free((spi_host_device_t)host.slot);
+        platform->card = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+static void pntr_app_esp32_sd_unmount(pntr_app_esp32_platform* platform) {
+    if (platform->card == NULL) {
+        return;
+    }
+
+    esp_vfs_fat_sdcard_unmount(PNTR_APP_ESP32_SD_MOUNT_POINT, platform->card);
+    spi_bus_free((spi_host_device_t)PNTR_APP_ESP32_SD_SPI_HOST);
+    platform->card = NULL;
+}
+
+#ifndef PNTR_LOAD_FILE
+#define PNTR_LOAD_FILE pntr_app_esp32_load_file
+/**
+ * Reads a whole file from the SD card into memory for pntr_load_file().
+ */
+unsigned char* pntr_app_esp32_load_file(const char* fileName, unsigned int* bytesRead) {
+    if (bytesRead != NULL) {
+        *bytesRead = 0;
+    }
+
+    char resolved[256];
+    const char* path = pntr_app_esp32_sd_path(fileName, resolved, sizeof(resolved));
+    if (path == NULL) {
+        return NULL;
+    }
+
+    FILE* file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+
+    long size = ftell(file);
+    if (size <= 0) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+
+    unsigned char* data = (unsigned char*)pntr_load_memory((size_t)size);
+    if (data == NULL) {
+        fclose(file);
+        return NULL;
+    }
+
+    size_t read = fread(data, 1, (size_t)size, file);
+    fclose(file);
+
+    if (read != (size_t)size) {
+        pntr_unload_memory(data);
+        return NULL;
+    }
+
+    if (bytesRead != NULL) {
+        *bytesRead = (unsigned int)size;
+    }
+
+    return data;
+}
+#endif  // PNTR_LOAD_FILE
+
+#ifndef PNTR_SAVE_FILE
+#define PNTR_SAVE_FILE pntr_app_esp32_save_file
+/**
+ * Writes a buffer out to the SD card for pntr_save_file().
+ */
+bool pntr_app_esp32_save_file(const char* fileName, const void* data, unsigned int bytesToWrite) {
+    if (data == NULL) {
+        return false;
+    }
+
+    char resolved[256];
+    const char* path = pntr_app_esp32_sd_path(fileName, resolved, sizeof(resolved));
+    if (path == NULL) {
+        return false;
+    }
+
+    FILE* file = fopen(path, "wb");
+    if (file == NULL) {
+        return false;
+    }
+
+    size_t written = fwrite(data, 1, (size_t)bytesToWrite, file);
+    fclose(file);
+
+    return written == (size_t)bytesToWrite;
+}
+#endif  // PNTR_SAVE_FILE
+#endif  // PNTR_APP_ESP32_SD
 
 /**
  * Works out the integer upscale and letterbox offsets for a screen of the given size.
@@ -583,36 +870,16 @@ bool pntr_app_platform_init(pntr_app* app) {
     #endif
 
     #ifndef PNTR_APP_ESP32_NO_TOUCH
-        gpio_config_t touchIrq;
-        memset(&touchIrq, 0, sizeof(touchIrq));
-        touchIrq.mode = GPIO_MODE_INPUT;
-        touchIrq.pin_bit_mask = 1ULL << PNTR_APP_ESP32_TOUCH_IRQ;
-        gpio_config(&touchIrq);
-
-        spi_bus_config_t touchBus;
-        memset(&touchBus, 0, sizeof(touchBus));
-        touchBus.mosi_io_num = PNTR_APP_ESP32_TOUCH_MOSI;
-        touchBus.miso_io_num = PNTR_APP_ESP32_TOUCH_MISO;
-        touchBus.sclk_io_num = PNTR_APP_ESP32_TOUCH_SCLK;
-        touchBus.quadwp_io_num = -1;
-        touchBus.quadhd_io_num = -1;
-        touchBus.max_transfer_sz = 32;
-
-        if (spi_bus_initialize(PNTR_APP_ESP32_TOUCH_SPI_HOST, &touchBus, SPI_DMA_DISABLED) == ESP_OK) {
-            spi_device_interface_config_t touch;
-            memset(&touch, 0, sizeof(touch));
-            touch.clock_speed_hz = 2 * 1000 * 1000;
-            touch.mode = 0;
-            touch.spics_io_num = PNTR_APP_ESP32_TOUCH_CS;
-            touch.queue_size = 1;
-
-            if (spi_bus_add_device(PNTR_APP_ESP32_TOUCH_SPI_HOST, &touch, &platform->touch) != ESP_OK) {
-                pntr_app_log(PNTR_APP_LOG_WARNING, "pntr_app_esp32: touch unavailable, continuing without it");
-                platform->touch = NULL;
-            }
+        platform->touchAvailable = pntr_app_esp32_touch_init();
+        if (!platform->touchAvailable) {
+            pntr_app_log(PNTR_APP_LOG_WARNING, "pntr_app_esp32: touch pins unavailable, continuing without it");
         }
-        else {
-            pntr_app_log(PNTR_APP_LOG_WARNING, "pntr_app_esp32: touch SPI bus unavailable, continuing without it");
+    #endif
+
+    #ifdef PNTR_APP_ESP32_SD
+        if (!pntr_app_esp32_sd_mount(platform)) {
+            // A missing or unformatted card is not fatal, file loading just returns NULL.
+            pntr_app_log(PNTR_APP_LOG_WARNING, "pntr_app_esp32: no SD card mounted, file loading is unavailable");
         }
     #endif
 
@@ -631,7 +898,7 @@ bool pntr_app_platform_events(pntr_app* app) {
 
     #ifndef PNTR_APP_ESP32_NO_TOUCH
         pntr_app_esp32_platform* platform = (pntr_app_esp32_platform*)app->platform;
-        if (platform->touch == NULL) {
+        if (!platform->touchAvailable) {
             return true;
         }
 
@@ -766,12 +1033,8 @@ void pntr_app_platform_close(pntr_app* app) {
         gpio_set_level((gpio_num_t)PNTR_APP_ESP32_LCD_BACKLIGHT, 0);
     #endif
 
-    #ifndef PNTR_APP_ESP32_NO_TOUCH
-        if (platform->touch != NULL) {
-            spi_bus_remove_device(platform->touch);
-            spi_bus_free(PNTR_APP_ESP32_TOUCH_SPI_HOST);
-            platform->touch = NULL;
-        }
+    #ifdef PNTR_APP_ESP32_SD
+        pntr_app_esp32_sd_unmount(platform);
     #endif
 
     for (int i = 0; i < 2; i++) {
